@@ -24,7 +24,4 @@ interface ServiceQuery : Query<DbService> {
 
   @Constraint("deleted_at", Operator.IS_NULL)
   fun notDeleted(): ServiceQuery
-
-  @Constraint("deleted_at", Operator.IS_NOT_NULL)
-  fun deleted(): ServiceQuery
 }

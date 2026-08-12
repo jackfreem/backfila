@@ -55,13 +55,12 @@ class ConfigureServiceAction @Inject constructor(
     transacter.transaction { session ->
       val variantsForService = queryFactory.newQuery<ServiceQuery>()
         .registryName(service)
-        .notDeleted()
         .list(session)
 
       var dbService = variantsForService.firstOrNull() { it.variant == variant }
 
       if (dbService == null) {
-        check(variantsForService.size <= MAX_VARIANTS) { "Variant limit exceeded" }
+        check(variantsForService.count { it.deleted_at == null } <= MAX_VARIANTS) { "Variant limit exceeded" }
 
         dbService = DbService(
           service,
@@ -73,6 +72,10 @@ class ConfigureServiceAction @Inject constructor(
         )
         session.save(dbService)
       } else {
+        if (dbService.deleted_at != null) {
+          logger.info { "Reviving soft-deleted variant `$variant` of service `$service`" }
+          dbService.deleted_at = null
+        }
         dbService.connector = request.connector_type
         dbService.connector_extra_data = request.connector_extra_data
         dbService.slack_channel = request.slack_channel

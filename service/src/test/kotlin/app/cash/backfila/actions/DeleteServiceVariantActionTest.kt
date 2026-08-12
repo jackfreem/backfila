@@ -13,13 +13,16 @@ import app.cash.backfila.protos.service.CreateBackfillRequest
 import app.cash.backfila.service.persistence.BackfilaDb
 import app.cash.backfila.service.persistence.BackfillState
 import app.cash.backfila.service.persistence.DbBackfillRun
+import app.cash.backfila.service.persistence.ServiceQuery
 import com.google.inject.Module
-import javax.inject.Inject
+import jakarta.inject.Inject
+import misk.audit.FakeAuditClient
 import misk.exceptions.BadRequestException
 import misk.hibernate.Id
 import misk.hibernate.Query
 import misk.hibernate.Transacter
 import misk.hibernate.load
+import misk.hibernate.newQuery
 import misk.scope.ActionScope
 import misk.testing.MiskTest
 import misk.testing.MiskTestModule
@@ -34,13 +37,23 @@ class DeleteServiceVariantActionTest {
   val module: Module = BackfilaTestingModule()
 
   @Inject lateinit var configureServiceAction: ConfigureServiceAction
+
   @Inject lateinit var deleteServiceVariantAction: DeleteServiceVariantAction
+
   @Inject lateinit var getServicesAction: GetServicesAction
+
   @Inject lateinit var getServiceVariantsAction: GetServiceVariantsAction
+
   @Inject lateinit var createBackfillAction: CreateBackfillAction
-  @Inject @BackfilaDb lateinit var transacter: Transacter
+
+  @Inject @BackfilaDb
+  lateinit var transacter: Transacter
+
   @Inject lateinit var queryFactory: Query.Factory
+
   @Inject lateinit var scope: ActionScope
+
+  @Inject lateinit var fakeAuditClient: FakeAuditClient
 
   @Test
   fun `delete a variant with no running backfills`() {
@@ -62,11 +75,21 @@ class DeleteServiceVariantActionTest {
       getServiceVariantsAction.variants("deep-fryer")
     }
     assertThat(variants.variants.map { it.name }).doesNotContain("playpen-jackf")
+
+    val auditEvent = fakeAuditClient.sentEvents.last()
+    assertThat(auditEvent.requestorLDAP).isEqualTo("molly")
+    assertThat(auditEvent.description).contains("deep-fryer").contains("playpen-jackf")
   }
 
   @Test
   fun `deleted variant does not appear in services list`() {
     scope.fakeCaller(service = "deep-fryer") {
+      configureServiceAction.configureService(
+        ConfigureServiceRequest.Builder()
+          .backfills(listOf())
+          .connector_type(Connectors.ENVOY)
+          .build(),
+      )
       configureServiceAction.configureService(
         ConfigureServiceRequest.Builder()
           .backfills(listOf())
@@ -84,7 +107,8 @@ class DeleteServiceVariantActionTest {
       getServicesAction.services()
     }
     val deepFryer = services.services.find { it.name == "deep-fryer" }
-    assertThat(deepFryer?.variants).doesNotContain("playpen-jackf")
+    assertThat(deepFryer).isNotNull()
+    assertThat(deepFryer!!.variants).contains("default").doesNotContain("playpen-jackf")
   }
 
   @Test
@@ -162,7 +186,7 @@ class DeleteServiceVariantActionTest {
   }
 
   @Test
-  fun `re-registering a deleted variant creates a fresh row`() {
+  fun `re-registering a deleted variant revives it in place`() {
     scope.fakeCaller(service = "deep-fryer") {
       configureServiceAction.configureService(
         ConfigureServiceRequest.Builder()
@@ -173,11 +197,20 @@ class DeleteServiceVariantActionTest {
       )
     }
 
+    val originalId = transacter.transaction { session ->
+      queryFactory.newQuery<ServiceQuery>()
+        .registryName("deep-fryer")
+        .variant("playpen-jackf")
+        .uniqueResult(session)!!
+        .id
+    }
+
     scope.fakeCaller(user = "molly") {
       deleteServiceVariantAction.delete("deep-fryer", "playpen-jackf")
     }
 
-    // Re-register the same variant - should succeed (creates new row)
+    // Re-register the same variant - revives the soft-deleted row rather than
+    // inserting a new one, which would collide with unq_registry_name_variant.
     scope.fakeCaller(service = "deep-fryer") {
       configureServiceAction.configureService(
         ConfigureServiceRequest.Builder()
@@ -192,5 +225,15 @@ class DeleteServiceVariantActionTest {
       getServiceVariantsAction.variants("deep-fryer")
     }
     assertThat(variants.variants.map { it.name }).contains("playpen-jackf")
+
+    val revived = transacter.transaction { session ->
+      queryFactory.newQuery<ServiceQuery>()
+        .registryName("deep-fryer")
+        .variant("playpen-jackf")
+        .notDeleted()
+        .uniqueResult(session)!!
+    }
+    assertThat(revived.id).isEqualTo(originalId)
+    assertThat(revived.deleted_at).isNull()
   }
 }
